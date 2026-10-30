@@ -1,0 +1,57 @@
+name: Foundation checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  foundation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Prepare local-only credentials
+        run: |
+          printf 'DB_DATABASE=dealflow\nDB_USERNAME=dealflow\nDB_PASSWORD=%s\nDEMO_PASSWORD=%s\n' "$(openssl rand -hex 24)" "$(openssl rand -hex 20)" > .env
+          cp apps/api/.env.example apps/api/.env
+      - name: Start API dependencies
+        run: |
+          docker compose build api worker
+          docker compose up -d --wait postgres redis
+          docker compose run --rm api composer install --no-interaction --prefer-dist
+          docker compose run --rm api php artisan key:generate
+          docker compose run --rm api php artisan migrate --force
+          docker compose run --rm api php artisan db:seed --force
+          docker compose up -d api worker
+      - name: Backend checks
+        run: |
+          docker compose exec -T api vendor/bin/pint --test
+          docker compose exec -T api php artisan test
+          docker compose exec -T postgres createdb -U dealflow dealflow_test
+          docker compose exec -T api vendor/bin/phpunit --configuration phpunit.pgsql.xml
+          docker compose exec -T api composer audit
+          curl --retry 10 --retry-connrefused --retry-all-errors --retry-delay 1 --fail http://localhost:8000/api/v1/health
+          docker compose exec -T api php artisan dealflow:queue-probe
+      - name: Frontend checks
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm run lint
+          npm run typecheck
+          npm test
+          npm audit
+          npm run build
+          npx playwright install --with-deps chromium
+      - name: Browser smoke tests
+        working-directory: apps/web
+        run: |
+          set -a
+          . ../../.env
+          set +a
+          npm run test:e2e
+      - name: Stop containers
+        if: always()
+        run: docker compose down
